@@ -1,0 +1,19 @@
+V2 Information Bottleneck Analysis
+============================================================
+
+Training divergence: KL / Gaussian Renyi / Gaussian Tsallis
+Renyi training alpha: 0.5
+Tsallis training alpha: 0.5
+Renyi entropy alpha: 2.0
+Tsallis entropy alpha: 2.0
+Beta: 0.001
+Latent dimension: 32
+Seed: 42
+
+I(X;Z) is evaluated using the KL-based Gaussian upper bound for all three trained models.
+
+                  I_XZ       H_Y  H_Y_given_Z      I_ZY  IB_objective
+divergence                                                           
+kl           14.798945  2.300848     0.021582  2.279267     14.796666
+renyi        23.697054  2.300848     0.023728  2.277121     23.694777
+tsallis     373.971191  2.300848     0.019948  2.280900    373.968911
