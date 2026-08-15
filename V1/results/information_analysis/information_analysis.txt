@@ -1,0 +1,12 @@
+V1 Information Bottleneck Analysis
+============================================================
+
+Beta: 0.001
+Latent dimension: 32
+Seed: 42
+
+                 I_XZ       H_Y  H_Y_given_Z      I_ZY  IB_objective
+divergence                                                          
+kl          14.798945  2.300848     0.021582  2.279267     14.796666
+renyi       12.299041  2.300848     0.027472  2.273377     12.296767
+tsallis      3.796930  2.300848     0.078851  2.221998      3.794708
