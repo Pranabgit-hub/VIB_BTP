@@ -13,7 +13,7 @@ from torchvision import datasets, transforms
 
 
 # =========================================================
-# PATH SETUP
+# PATHS
 # =========================================================
 
 ROOT_DIR = os.path.dirname(
@@ -22,13 +22,13 @@ ROOT_DIR = os.path.dirname(
     )
 )
 
-V2_DIR = os.path.dirname(
+V3_DIR = os.path.dirname(
     os.path.abspath(__file__)
 )
 
 sys.path.insert(
     0,
-    V2_DIR
+    V3_DIR
 )
 
 
@@ -38,9 +38,7 @@ sys.path.insert(
 
 from model import VIB
 
-from divergences import (
-    divergence_loss
-)
+from divergences import divergence_loss
 
 from entropy import (
     shannon_entropy,
@@ -69,30 +67,18 @@ LATENT_DIM = 32
 
 
 # ---------------------------------------------------------
-# TRAINING DIVERGENCE ALPHA
-#
 # IMPORTANT:
 #
-# V2 uses alpha = 0.5 for Gaussian Renyi/Tsallis
-# training because 0 < alpha < 1 guarantees that
-# the Gaussian power integral remains finite.
-# ---------------------------------------------------------
-
-RENYI_TRAINING_ALPHA = 0.5
-
-TSALLIS_TRAINING_ALPHA = 0.5
-
-
-# ---------------------------------------------------------
-# HISTOGRAM ENTROPY ALPHA
+# V3 uses alpha = 0.5 for both divergences.
 #
-# Keep these at 2.0 so entropy measurements remain
-# comparable with V1.
+# This is NOT Monte Carlo.
+#
+# Both are calculated using the exact Gaussian closed form.
 # ---------------------------------------------------------
 
-RENYI_ENTROPY_ALPHA = 2.0
+RENYI_ALPHA = 0.5
 
-TSALLIS_ENTROPY_ALPHA = 2.0
+TSALLIS_ALPHA = 0.5
 
 
 SEED = 42
@@ -110,7 +96,7 @@ DIVERGENCES = [
 # =========================================================
 
 RESULTS_DIR = os.path.join(
-    V2_DIR,
+    V3_DIR,
     "results"
 )
 
@@ -177,7 +163,11 @@ device = torch.device(
 
 
 print("=" * 60)
-print("VIB VERSION 2 EXPERIMENT")
+
+print(
+    "VIB VERSION 3 - EXACT GAUSSIAN DIVERGENCES"
+)
+
 print("=" * 60)
 
 print(
@@ -201,23 +191,11 @@ print(
 )
 
 print(
-    f"Renyi training alpha: "
-    f"{RENYI_TRAINING_ALPHA}"
+    f"Renyi alpha: {RENYI_ALPHA}"
 )
 
 print(
-    f"Tsallis training alpha: "
-    f"{TSALLIS_TRAINING_ALPHA}"
-)
-
-print(
-    f"Renyi entropy alpha: "
-    f"{RENYI_ENTROPY_ALPHA}"
-)
-
-print(
-    f"Tsallis entropy alpha: "
-    f"{TSALLIS_ENTROPY_ALPHA}"
+    f"Tsallis alpha: {TSALLIS_ALPHA}"
 )
 
 print("=" * 60)
@@ -267,25 +245,6 @@ test_loader = DataLoader(
 
 
 # =========================================================
-# HELPER: TRAINING ALPHA
-# =========================================================
-
-def get_training_alpha(
-    divergence
-):
-
-    if divergence == "renyi":
-
-        return RENYI_TRAINING_ALPHA
-
-    if divergence == "tsallis":
-
-        return TSALLIS_TRAINING_ALPHA
-
-    return 0.5
-
-
-# =========================================================
 # TRAINING
 # =========================================================
 
@@ -301,9 +260,8 @@ def train_model(
 
     history = []
 
-    for epoch in range(
-        EPOCHS
-    ):
+
+    for epoch in range(EPOCHS):
 
         model.train()
 
@@ -313,6 +271,7 @@ def train_model(
 
         total_information = 0.0
 
+
         for images, labels in train_loader:
 
             images = images.view(
@@ -320,60 +279,95 @@ def train_model(
                 -1
             ).to(device)
 
-            labels = labels.to(
-                device
-            )
+            labels = labels.to(device)
+
 
             optimizer.zero_grad()
+
 
             logits, z, mu, logvar = model(
                 images
             )
 
-            classification_loss = (
-                F.cross_entropy(
-                    logits,
-                    labels
-                )
-            )
 
             # -------------------------------------------------
-            # TRAINING DIVERGENCE
+            # Classification loss
+            # -------------------------------------------------
+
+            classification_loss = F.cross_entropy(
+                logits,
+                labels
+            )
+
+
+            # -------------------------------------------------
+            # Training divergence
             #
             # KL:
-            #     exact Gaussian KL
+            #   Gaussian KL
             #
             # Renyi:
-            #     exact Gaussian closed form
+            #   Exact Gaussian Renyi,
+            #   alpha = 0.5
             #
             # Tsallis:
-            #     exact Gaussian closed form
-            #
-            # IMPORTANT:
-            # This affects ONLY the training regularizer.
+            #   Exact Gaussian Tsallis,
+            #   alpha = 0.5
             # -------------------------------------------------
+
+            if divergence == "renyi":
+
+                alpha = RENYI_ALPHA
+
+            elif divergence == "tsallis":
+
+                alpha = TSALLIS_ALPHA
+
+            else:
+
+                alpha = 0.5
+
 
             information_loss = divergence_loss(
                 mu,
                 logvar,
                 divergence=divergence,
-                alpha=get_training_alpha(
-                    divergence
-                )
+                alpha=alpha
             )
+
+
+            # -------------------------------------------------
+            # VIB objective
+            # -------------------------------------------------
 
             loss = (
                 classification_loss
                 + BETA * information_loss
             )
 
-            loss.backward()
 
             # -------------------------------------------------
-            # Gradient clipping prevents an isolated unstable
-            # update from terminating the experiment.
+            # Numerical sanity check
+            # -------------------------------------------------
+
+            if not torch.isfinite(loss):
+
+                raise RuntimeError(
+                    f"Non-finite loss encountered during "
+                    f"{divergence} training."
+                )
+
+
+            loss.backward()
+
+
+            # -------------------------------------------------
+            # Gradient clipping
             #
             # This does NOT change the divergence formula.
+            #
+            # It prevents one unstable gradient step from
+            # destroying the learned Gaussian parameters.
             # -------------------------------------------------
 
             torch.nn.utils.clip_grad_norm_(
@@ -381,7 +375,9 @@ def train_model(
                 max_norm=5.0
             )
 
+
             optimizer.step()
+
 
             total_loss += loss.item()
 
@@ -393,9 +389,11 @@ def train_model(
                 information_loss.item()
             )
 
+
         n_batches = len(
             train_loader
         )
+
 
         epoch_loss = (
             total_loss
@@ -412,6 +410,7 @@ def train_model(
             / n_batches
         )
 
+
         history.append({
 
             "epoch":
@@ -427,6 +426,7 @@ def train_model(
                 epoch_information
         })
 
+
         print(
             f"[{divergence.upper():7s}] "
             f"Epoch {epoch + 1:02d}/{EPOCHS} | "
@@ -434,6 +434,7 @@ def train_model(
             f"CE: {epoch_ce:.4f} | "
             f"Info: {epoch_information:.4f}"
         )
+
 
     return history
 
@@ -449,13 +450,16 @@ def evaluate_model(
 
     model.eval()
 
+
     correct = 0
 
     total = 0
 
+
     total_ce = 0.0
 
     total_information = 0.0
+
 
     latent_samples = []
 
@@ -477,49 +481,61 @@ def evaluate_model(
                 -1
             ).to(device)
 
-            labels = labels.to(
-                device
-            )
+            labels = labels.to(device)
+
 
             logits, z, mu, logvar = model(
                 images
             )
+
 
             ce = F.cross_entropy(
                 logits,
                 labels
             )
 
-            # -------------------------------------------------
-            # Evaluate the SAME divergence that was used
-            # during training.
-            # -------------------------------------------------
+
+            if divergence == "renyi":
+
+                alpha = RENYI_ALPHA
+
+            elif divergence == "tsallis":
+
+                alpha = TSALLIS_ALPHA
+
+            else:
+
+                alpha = 0.5
+
 
             info = divergence_loss(
                 mu,
                 logvar,
                 divergence=divergence,
-                alpha=get_training_alpha(
-                    divergence
-                )
+                alpha=alpha
             )
+
 
             predictions = torch.argmax(
                 logits,
                 dim=1
             )
 
+
             correct += (
                 predictions == labels
             ).sum().item()
 
+
             total += labels.size(0)
+
 
             total_ce += ce.item()
 
             total_information += (
                 info.item()
             )
+
 
             latent_samples.append(
                 z.cpu()
@@ -543,7 +559,8 @@ def evaluate_model(
 
 
     accuracy = (
-        correct / total
+        correct
+        / total
     )
 
 
@@ -611,20 +628,10 @@ def estimate_entropy(
     latent
 ):
 
-    """
-    Histogram-based entropy estimation.
-
-    IMPORTANT:
-    The entropy calculation is independent of the
-    Gaussian training divergence.
-
-    V1-compatible entropy alpha values are used:
-
-        Renyi alpha   = 2.0
-        Tsallis alpha = 2.0
-    """
-
-    values = latent.numpy().flatten()
+    values = (
+        latent.numpy()
+        .flatten()
+    )
 
 
     hist, _ = np.histogram(
@@ -658,13 +665,13 @@ def estimate_entropy(
 
     renyi = renyi_entropy(
         probabilities,
-        alpha=RENYI_ENTROPY_ALPHA
+        alpha=RENYI_ALPHA
     ).item()
 
 
     tsallis = tsallis_entropy(
         probabilities,
-        alpha=TSALLIS_ENTROPY_ALPHA
+        alpha=TSALLIS_ALPHA
     ).item()
 
 
@@ -682,7 +689,7 @@ def estimate_entropy(
 
 
 # =========================================================
-# PLOT BAR
+# PLOTTING
 # =========================================================
 
 def plot_bar(
@@ -743,10 +750,6 @@ def plot_bar(
     plt.close()
 
 
-# =========================================================
-# ACCURACY VS INFORMATION
-# =========================================================
-
 def plot_accuracy_vs_information(
     results
 ):
@@ -782,7 +785,7 @@ def plot_accuracy_vs_information(
 
 
     plt.xlabel(
-        "Information Loss"
+        "Training Divergence"
     )
 
     plt.ylabel(
@@ -790,7 +793,7 @@ def plot_accuracy_vs_information(
     )
 
     plt.title(
-        "V2 Accuracy vs Training Divergence"
+        "Accuracy vs Training Divergence"
     )
 
     plt.legend()
@@ -801,7 +804,7 @@ def plot_accuracy_vs_information(
     plt.savefig(
         os.path.join(
             PLOTS_DIR,
-            "accuracy_vs_information_v2.png"
+            "accuracy_vs_information.png"
         ),
         dpi=300
     )
@@ -809,77 +812,6 @@ def plot_accuracy_vs_information(
 
     plt.close()
 
-
-# =========================================================
-# ACCURACY VS I(X;Z)
-# =========================================================
-
-def plot_accuracy_vs_ixz(
-    results
-):
-
-    plt.figure(
-        figsize=(7, 5)
-    )
-
-
-    for method in results:
-
-        x = results[method][
-            "I_XZ"
-        ]
-
-        y = results[method][
-            "accuracy"
-        ]
-
-
-        plt.scatter(
-            x,
-            y,
-            s=100,
-            label=method.upper()
-        )
-
-
-        plt.annotate(
-            method.upper(),
-            (x, y)
-        )
-
-
-    plt.xlabel(
-        "I(X;Z)"
-    )
-
-    plt.ylabel(
-        "Accuracy"
-    )
-
-    plt.title(
-        "Accuracy vs I(X;Z)"
-    )
-
-    plt.legend()
-
-    plt.tight_layout()
-
-
-    plt.savefig(
-        os.path.join(
-            PLOTS_DIR,
-            "accuracy_vs_I_XZ_v2.png"
-        ),
-        dpi=300
-    )
-
-
-    plt.close()
-
-
-# =========================================================
-# INFORMATION BOTTLENECK TRADEOFF
-# =========================================================
 
 def plot_ib_tradeoff(
     results
@@ -935,7 +867,7 @@ def plot_ib_tradeoff(
     plt.savefig(
         os.path.join(
             PLOTS_DIR,
-            "information_bottleneck_tradeoff_v2.png"
+            "information_bottleneck_tradeoff.png"
         ),
         dpi=300
     )
@@ -945,111 +877,7 @@ def plot_ib_tradeoff(
 
 
 # =========================================================
-# INFORMATION ANALYSIS PLOTS
-# =========================================================
-
-def generate_information_plots(
-    information_results
-):
-
-    information_plot_specs = [
-
-        (
-            "I_XZ",
-            "Information in Latent Representation",
-            "I(X;Z)",
-            "I_XZ.png"
-        ),
-
-        (
-            "H_Y",
-            "Entropy of Target Labels",
-            "H(Y)",
-            "H_Y.png"
-        ),
-
-        (
-            "H_Y_given_Z",
-            "Conditional Entropy of Labels Given Z",
-            "H(Y|Z)",
-            "H_Y_given_Z.png"
-        ),
-
-        (
-            "I_ZY",
-            "Information About Y Retained in Z",
-            "I(Z;Y)",
-            "I_ZY.png"
-        ),
-
-        (
-            "IB_objective",
-            "Information Bottleneck Objective",
-            "I(X;Z) - beta I(Z;Y)",
-            "IB_objective.png"
-        )
-    ]
-
-
-    for (
-        metric,
-        title,
-        ylabel,
-        filename
-    ) in information_plot_specs:
-
-        methods = list(
-            information_results.keys()
-        )
-
-
-        values = [
-            information_results[m][metric]
-            for m in methods
-        ]
-
-
-        plt.figure(
-            figsize=(7, 5)
-        )
-
-
-        plt.bar(
-            methods,
-            values
-        )
-
-
-        plt.xlabel(
-            "Divergence"
-        )
-
-        plt.ylabel(
-            ylabel
-        )
-
-        plt.title(
-            title
-        )
-
-
-        plt.tight_layout()
-
-
-        plt.savefig(
-            os.path.join(
-                INFORMATION_RESULTS_DIR,
-                filename
-            ),
-            dpi=300
-        )
-
-
-        plt.close()
-
-
-# =========================================================
-# MAIN EXPERIMENT
+# MAIN
 # =========================================================
 
 def main():
@@ -1066,13 +894,10 @@ def main():
     histories = {}
 
 
-    # =====================================================
-    # TRAIN KL / RENYI / TSALLIS
-    # =====================================================
-
     for divergence in DIVERGENCES:
 
         print("\n")
+
         print("=" * 60)
 
         print(
@@ -1083,7 +908,7 @@ def main():
 
 
         # -------------------------------------------------
-        # Fresh model for each divergence
+        # Fresh model
         # -------------------------------------------------
 
         model = VIB(
@@ -1117,7 +942,7 @@ def main():
 
 
         # -------------------------------------------------
-        # Histogram entropy
+        # Entropy
         # -------------------------------------------------
 
         entropy_results = estimate_entropy(
@@ -1130,20 +955,26 @@ def main():
         #
         # IMPORTANT:
         #
-        # I(X;Z) is STILL calculated using the KL
-        # upper-bound approximation for ALL models.
+        # I(X;Z) is ALWAYS calculated using the
+        # KL Gaussian upper-bound expression.
         #
-        # The training divergence does NOT replace
-        # this calculation.
+        # We DO NOT calculate I(X;Z) using the
+        # Renyi or Tsallis training divergence.
         # -------------------------------------------------
 
         information_metric_results = (
             calculate_all_information_metrics(
+
                 mu=evaluation["mu"],
+
                 logvar=evaluation["logvar"],
+
                 labels=evaluation["labels"],
+
                 logits=evaluation["logits"],
+
                 num_classes=10,
+
                 beta=BETA
             )
         )
@@ -1155,10 +986,12 @@ def main():
 
 
         # -------------------------------------------------
-        # Combine all metrics
+        # Combine results
         # -------------------------------------------------
 
-        results[divergence] = {
+        results[
+            divergence
+        ] = {
 
             "accuracy":
                 evaluation[
@@ -1189,6 +1022,10 @@ def main():
                 entropy_results[
                     "tsallis_entropy"
                 ],
+
+            # ---------------------------------------------
+            # Common KL-based IB analysis
+            # ---------------------------------------------
 
             "I_XZ":
                 information_metric_results[
@@ -1237,7 +1074,8 @@ def main():
 
 
         print(
-            f"Training Divergence: "
+            f"Training {divergence.upper()} "
+            f"Divergence: "
             f"{evaluation['information_loss']:.4f}"
         )
 
@@ -1311,7 +1149,7 @@ def main():
 
     csv_path = os.path.join(
         METRICS_DIR,
-        "results_v2.csv"
+        "results_v3.csv"
     )
 
 
@@ -1321,10 +1159,14 @@ def main():
 
 
     print("\n")
-    print("=" * 60)
-    print("V2 FINAL RESULTS")
+
     print("=" * 60)
 
+    print(
+        "V3 FINAL RESULTS"
+    )
+
+    print("=" * 60)
 
     print(
         dataframe
@@ -1332,6 +1174,7 @@ def main():
 
 
     print("\nSaved:")
+
     print(
         csv_path
     )
@@ -1388,7 +1231,7 @@ def main():
     ) as f:
 
         f.write(
-            "V2 Information Bottleneck Analysis\n"
+            "V3 Information Bottleneck Analysis\n"
         )
 
         f.write(
@@ -1397,63 +1240,59 @@ def main():
         )
 
         f.write(
-            "Training divergence: "
-            "KL / Gaussian Renyi / Gaussian Tsallis\n"
-        )
-
-        f.write(
-            f"Renyi training alpha: "
-            f"{RENYI_TRAINING_ALPHA}\n"
-        )
-
-        f.write(
-            f"Tsallis training alpha: "
-            f"{TSALLIS_TRAINING_ALPHA}\n"
-        )
-
-        f.write(
-            f"Renyi entropy alpha: "
-            f"{RENYI_ENTROPY_ALPHA}\n"
-        )
-
-        f.write(
-            f"Tsallis entropy alpha: "
-            f"{TSALLIS_ENTROPY_ALPHA}\n"
-        )
-
-        f.write(
             f"Beta: {BETA}\n"
         )
 
         f.write(
-            f"Latent dimension: "
-            f"{LATENT_DIM}\n"
+            f"Latent dimension: {LATENT_DIM}\n"
         )
 
         f.write(
-            f"Seed: {SEED}\n\n"
+            f"Seed: {SEED}\n"
+        )
+
+        f.write(
+            f"Renyi alpha: {RENYI_ALPHA}\n"
+        )
+
+        f.write(
+            f"Tsallis alpha: {TSALLIS_ALPHA}\n\n"
+        )
+
+        f.write(
+            "IMPORTANT:\n"
         )
 
         f.write(
             "I(X;Z) is evaluated using the "
-            "KL-based Gaussian upper bound "
-            "for all three trained models.\n\n"
+            "Gaussian KL upper bound for all models.\n"
+        )
+
+        f.write(
+            "The Renyi/Tsallis divergences are used "
+            "only for training.\n\n"
         )
 
         f.write(
             information_dataframe.to_string()
         )
 
-        f.write("\n")
+        f.write(
+            "\n"
+        )
 
 
-    print("\nInformation Analysis:")
+    print(
+        "\nInformation Analysis:"
+    )
+
     print(
         information_dataframe
     )
 
 
     print("\nSaved:")
+
     print(
         information_csv_path
     )
@@ -1464,33 +1303,33 @@ def main():
 
 
     # =====================================================
-    # GENERATE MAIN PLOTS
+    # PLOTS
     # =====================================================
 
     plot_bar(
         results,
         "accuracy",
-        "V2 VIB Classification Accuracy",
+        "V3 VIB Classification Accuracy",
         "Accuracy",
-        "accuracy_v2.png"
+        "accuracy_v3.png"
     )
 
 
     plot_bar(
         results,
         "cross_entropy",
-        "V2 VIB Cross Entropy",
+        "V3 VIB Cross Entropy",
         "Cross Entropy",
-        "cross_entropy_v2.png"
+        "cross_entropy_v3.png"
     )
 
 
     plot_bar(
         results,
         "information_loss",
-        "V2 Training Divergence",
+        "V3 Training Divergence",
         "Divergence",
-        "training_divergence_v2.png"
+        "training_divergence_v3.png"
     )
 
 
@@ -1499,7 +1338,7 @@ def main():
         "shannon_entropy",
         "Shannon Entropy of Latent Representation",
         "Shannon Entropy",
-        "shannon_entropy_v2.png"
+        "shannon_entropy_v3.png"
     )
 
 
@@ -1508,7 +1347,7 @@ def main():
         "renyi_entropy",
         "Renyi Entropy of Latent Representation",
         "Renyi Entropy",
-        "renyi_entropy_v2.png"
+        "renyi_entropy_v3.png"
     )
 
 
@@ -1517,16 +1356,16 @@ def main():
         "tsallis_entropy",
         "Tsallis Entropy of Latent Representation",
         "Tsallis Entropy",
-        "tsallis_entropy_v2.png"
+        "tsallis_entropy_v3.png"
     )
 
 
     plot_bar(
         results,
         "I_XZ",
-        "I(X;Z) - KL Evaluation",
+        "I(X;Z) - KL Gaussian Upper Bound",
         "I(X;Z)",
-        "I_XZ_v2.png"
+        "I_XZ_v3.png"
     )
 
 
@@ -1535,7 +1374,7 @@ def main():
         "I_ZY",
         "I(Z;Y)",
         "I(Z;Y)",
-        "I_ZY_v2.png"
+        "I_ZY_v3.png"
     )
 
 
@@ -1544,16 +1383,11 @@ def main():
         "IB_objective",
         "Information Bottleneck Objective",
         "I(X;Z) - Beta I(Z;Y)",
-        "IB_objective_v2.png"
+        "IB_objective_v3.png"
     )
 
 
     plot_accuracy_vs_information(
-        results
-    )
-
-
-    plot_accuracy_vs_ixz(
         results
     )
 
@@ -1567,16 +1401,106 @@ def main():
     # INFORMATION ANALYSIS PLOTS
     # =====================================================
 
-    generate_information_plots(
-        information_results
+    information_plot_specs = [
+
+        (
+            "I_XZ",
+            "Information in Latent Representation",
+            "I(X;Z)",
+            "I_XZ.png"
+        ),
+
+        (
+            "H_Y",
+            "Entropy of Target Labels",
+            "H(Y)",
+            "H_Y.png"
+        ),
+
+        (
+            "H_Y_given_Z",
+            "Conditional Entropy of Labels Given Z",
+            "H(Y|Z)",
+            "H_Y_given_Z.png"
+        ),
+
+        (
+            "I_ZY",
+            "Information About Y Retained in Z",
+            "I(Z;Y)",
+            "I_ZY.png"
+        ),
+
+        (
+            "IB_objective",
+            "Information Bottleneck Objective",
+            "IB Objective",
+            "IB_objective.png"
+        )
+    ]
+
+
+    for (
+        metric,
+        title,
+        ylabel,
+        filename
+    ) in information_plot_specs:
+
+        methods = list(
+            information_results.keys()
+        )
+
+
+        values = [
+            information_results[m][metric]
+            for m in methods
+        ]
+
+
+        plt.figure(
+            figsize=(7, 5)
+        )
+
+
+        plt.bar(
+            methods,
+            values
+        )
+
+
+        plt.xlabel(
+            "Divergence"
+        )
+
+        plt.ylabel(
+            ylabel
+        )
+
+        plt.title(
+            title
+        )
+
+
+        plt.tight_layout()
+
+
+        plt.savefig(
+            os.path.join(
+                INFORMATION_RESULTS_DIR,
+                filename
+            ),
+            dpi=300
+        )
+
+
+        plt.close()
+
+
+    print(
+        "\nGraphs saved to:"
     )
 
-
-    # =====================================================
-    # FINAL MESSAGE
-    # =====================================================
-
-    print("\nGraphs saved to:")
     print(
         PLOTS_DIR
     )
@@ -1591,7 +1515,9 @@ def main():
     )
 
 
-    print("\nExperiment completed.")
+    print(
+        "\nExperiment completed."
+    )
 
 
 # =========================================================
@@ -1599,4 +1525,5 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     main()
