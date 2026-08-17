@@ -344,6 +344,15 @@ def train_model(
                 + BETA * information_loss
             )
 
+            # Add weak KL regularizer to prevent vanishing gradients
+            if divergence == "tsallis":
+                kl_loss = divergence_loss(
+                    mu,
+                    logvar,
+                    divergence="kl"
+                )
+                loss = loss + 1e-5 * kl_loss
+
 
             # Numerical sanity check
             if not torch.isfinite(loss):
