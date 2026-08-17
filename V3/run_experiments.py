@@ -76,9 +76,9 @@ LATENT_DIM = 32
 # Both are calculated using the exact Gaussian closed form.
 # ---------------------------------------------------------
 
-RENYI_ALPHA = 0.5
+RENYI_ALPHA = 0.95
 
-TSALLIS_ALPHA = 0.5
+TSALLIS_ALPHA = 0.95
 
 
 SEED = 42
