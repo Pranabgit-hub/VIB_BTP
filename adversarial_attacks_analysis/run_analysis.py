@@ -71,6 +71,35 @@ BETA = 1e-3
 
 LATENT_DIM = 32
 
+# ---------------------------------------------------------
+# Dataset switch
+#
+# Change DATASET_NAME to "mnist" or "cifar10" to switch
+# datasets. Everything else (input_dim, results folders)
+# follows automatically from this one setting.
+# ---------------------------------------------------------
+
+DATASET_NAME = "cifar10"
+
+DATASET_REGISTRY = {
+    "mnist": {
+        "dataset_class": datasets.MNIST,
+        "input_dim": 28 * 28 * 1,
+    },
+    "cifar10": {
+        "dataset_class": datasets.CIFAR10,
+        "input_dim": 32 * 32 * 3,
+    },
+}
+
+if DATASET_NAME not in DATASET_REGISTRY:
+    raise ValueError(
+        f"Unknown DATASET_NAME: {DATASET_NAME}. "
+        f"Choose from: {list(DATASET_REGISTRY.keys())}"
+    )
+
+INPUT_DIM = DATASET_REGISTRY[DATASET_NAME]["input_dim"]
+
 
 # ---------------------------------------------------------
 # Alpha values — matching V3
@@ -114,7 +143,8 @@ PGD_STEP_SIZE = None  # defaults to epsilon / 4
 
 RESULTS_DIR = os.path.join(
     ANALYSIS_DIR,
-    "results"
+    "results",
+    DATASET_NAME
 )
 
 METRICS_DIR = os.path.join(
@@ -194,7 +224,15 @@ print(
 )
 
 print(
+    f"Dataset: {DATASET_NAME}"
+)
+
+print(
     f"Beta: {BETA}"
+)
+
+print(
+    f"Input dim: {INPUT_DIM}"
 )
 
 print(
@@ -227,7 +265,10 @@ print("=" * 60)
 transform = transforms.ToTensor()
 
 
-train_dataset = datasets.MNIST(
+dataset_cls = DATASET_REGISTRY[DATASET_NAME]["dataset_class"]
+
+
+train_dataset = dataset_cls(
     root=os.path.join(
         ROOT_DIR,
         "data"
@@ -238,7 +279,7 @@ train_dataset = datasets.MNIST(
 )
 
 
-test_dataset = datasets.MNIST(
+test_dataset = dataset_cls(
     root=os.path.join(
         ROOT_DIR,
         "data"
@@ -989,6 +1030,7 @@ def main():
         # -------------------------------------------------
 
         model = VIB(
+            input_dim=INPUT_DIM,
             latent_dim=LATENT_DIM
         ).to(device)
 
