@@ -54,7 +54,8 @@ from information_metrics import (
 from adversarial_attacks import (
     fgsm_attack,
     pgd_attack,
-    evaluate_under_attack
+    evaluate_under_attack,
+    generate_adversarial_batch
 )
 
 
@@ -88,7 +89,7 @@ TEST_SUBSET_FRACTION = 1.0
 
 LEARNING_RATE = 1e-3
 
-BETA = 1e-3
+BETA = 1e-5
 
 LATENT_DIM = 32
 
@@ -256,8 +257,78 @@ PGD_STEPS = 10
 PGD_STEP_SIZE = None  # defaults to epsilon / 4
 
 
+# ---------------------------------------------------------
+# ADVERSARIAL TRAINING CONFIGURATION
+#
+# FGSM / PGD appear in TWO distinct roles in this pipeline:
+#
+#   1. TRAINING  (adversarial training, Madry-style):
+#      each training batch is replaced by an adversarial
+#      version crafted on-the-fly with the chosen method,
+#      and the VIB objective is minimized on those examples.
+#      Controlled by TRAINING_MODES below.
+#
+#   2. EVALUATION (unchanged): after training, every model —
+#      clean-trained or adversarially-trained — is probed
+#      with white-box FGSM and PGD attacks at all EPSILONS.
+#
+# TRAINING_MODES selects which training variants run:
+#   "clean" -> standard training (original behaviour)
+#   "fgsm"  -> FGSM-adversarial training
+#   "pgd"   -> PGD-adversarial training (num_steps =
+#              ADV_TRAIN_PGD_STEPS)
+# Each mode writes its results to its own subfolder under
+# results/<dataset>/ so all variants stay comparable.
+# ---------------------------------------------------------
+
+TRAINING_MODES = [
+    "clean",
+    "fgsm",
+    "pgd"
+]
+
+TRAINING_MODE_TAGS = {
+    "clean": "standard",
+    "fgsm": "advtrain_fgsm",
+    "pgd": "advtrain_pgd"
+}
+
+# Perturbation budget used while crafting TRAINING batches.
+# Default: 8/255 ~= 0.031, the standard CIFAR-10 budget.
+ADV_TRAIN_EPSILON = DATASET_CONFIG.get(
+    "adv_train_epsilon",
+    8.0 / 255.0
+)
+
+# Inner-maximization steps during PGD adversarial training.
+ADV_TRAIN_PGD_STEPS = DATASET_CONFIG.get(
+    "adv_train_pgd_steps",
+    5
+)
+
+# Optional epoch override for adversarially-trained runs
+# (None = same as standard training). Adversarial epochs are
+# ~3x (FGSM) to ~6x (PGD-5) more expensive per epoch; lower
+# this if CPU runtime becomes prohibitive.
+ADV_TRAIN_EPOCHS_OVERRIDE = DATASET_CONFIG.get(
+    "adv_train_epochs",
+    None
+)
+
+
 # =========================================================
 # RESULTS DIRECTORIES
+#
+# Per-training-mode subfolders keep every variant's outputs
+# separate:
+#
+#   results/<dataset>/standard/metrics|plots        (clean)
+#   results/<dataset>/advtrain_fgsm/metrics|plots
+#   results/<dataset>/advtrain_pgd/metrics|plots
+#
+# plus dataset-level cross-mode comparison artifacts at
+# results/<dataset>/{adversarial_training_comparison.csv,
+# plots/adversarial_training_comparison.png}.
 # =========================================================
 
 RESULTS_DIR = os.path.join(
@@ -268,13 +339,50 @@ RESULTS_DIR = os.path.join(
 
 METRICS_DIR = os.path.join(
     RESULTS_DIR,
+    "standard",
     "metrics"
 )
 
 PLOTS_DIR = os.path.join(
     RESULTS_DIR,
+    "standard",
     "plots"
 )
+
+
+def set_output_dirs(training_mode):
+    """
+    Point METRICS_DIR / PLOTS_DIR at the folder for the
+    given training mode. Plot/save helpers read these
+    module-level globals, so calling this before the save
+    stage routes all artifacts of that run correctly.
+    """
+
+    global METRICS_DIR, PLOTS_DIR
+
+    tag = TRAINING_MODE_TAGS[training_mode]
+
+    METRICS_DIR = os.path.join(
+        RESULTS_DIR,
+        tag,
+        "metrics"
+    )
+
+    PLOTS_DIR = os.path.join(
+        RESULTS_DIR,
+        tag,
+        "plots"
+    )
+
+    os.makedirs(
+        METRICS_DIR,
+        exist_ok=True
+    )
+
+    os.makedirs(
+        PLOTS_DIR,
+        exist_ok=True
+    )
 
 
 os.makedirs(
@@ -337,6 +445,26 @@ print(
 print(
     f"Epochs: {EPOCHS}"
 )
+
+print(
+    f"Training modes: {', '.join(TRAINING_MODES)}"
+)
+
+print(
+    f"Adv-training epsilon: "
+    f"{ADV_TRAIN_EPSILON:.4f} (8/255 default)"
+)
+
+print(
+    f"Adv-training PGD steps: {ADV_TRAIN_PGD_STEPS}"
+)
+
+if ADV_TRAIN_EPOCHS_OVERRIDE is not None:
+
+    print(
+        f"Adv-training epochs override: "
+        f"{ADV_TRAIN_EPOCHS_OVERRIDE}"
+    )
 
 print(
     f"Batch size: {BATCH_SIZE}"
@@ -536,8 +664,35 @@ test_loader = DataLoader(
 
 def train_model(
     model,
-    divergence
+    divergence,
+    training_mode="clean",
+    epochs=None
 ):
+    """
+    Train one VIB model.
+
+    training_mode selects the batch distribution:
+
+        "clean" -> standard VIB training on clean images
+
+        "fgsm"  -> FGSM-adversarial training: every batch is
+                   replaced by a single-step adversarial
+                   version (eps = ADV_TRAIN_EPSILON)
+
+        "pgd"   -> PGD-adversarial training: every batch is
+                   replaced by a multi-step PGD inner
+                   maximization (Madry-style) at the same eps
+
+    The divergence term is computed on the SAME forward pass
+    used for classification (mu / logvar of the batch the CE
+    loss sees), so the VIB objective stays consistent under
+    all three modes.
+    """
+
+    if epochs is None:
+
+        epochs = EPOCHS
+
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -548,7 +703,7 @@ def train_model(
     # improves convergence on harder datasets.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=EPOCHS
+        T_max=epochs
     )
 
     history = []
@@ -558,7 +713,7 @@ def train_model(
     epoch_times = []
 
 
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
 
         epoch_start = time.time()
 
@@ -576,6 +731,29 @@ def train_model(
             images = images.to(device)
 
             labels = labels.to(device)
+
+
+            # -------------------------------------------------
+            # Adversarial training: replace the batch with an
+            # adversarial version crafted on-the-fly. This
+            # must happen BEFORE optimizer.zero_grad() — the
+            # generator uses autograd.grad and never touches
+            # parameter .grad buffers, so the only gradients
+            # the optimizer sees are from the training loss
+            # below.
+            # -------------------------------------------------
+
+            if training_mode != "clean":
+
+                images = generate_adversarial_batch(
+                    model,
+                    images,
+                    labels,
+                    ADV_TRAIN_EPSILON,
+                    device,
+                    method=training_mode,
+                    num_steps=ADV_TRAIN_PGD_STEPS
+                )
 
 
             optimizer.zero_grad()
@@ -696,7 +874,7 @@ def train_model(
         )
 
         eta_seconds = (
-            avg_epoch * (EPOCHS - epoch - 1)
+            avg_epoch * (epochs - epoch - 1)
         )
 
         eta_minutes = eta_seconds / 60.0
@@ -720,7 +898,8 @@ def train_model(
 
         print(
             f"[{divergence.upper():7s}] "
-            f"Epoch {epoch + 1:02d}/{EPOCHS} | "
+            f"[train: {training_mode.upper()}] "
+            f"Epoch {epoch + 1:02d}/{epochs} | "
             f"Loss: {epoch_loss:.4f} | "
             f"CE: {epoch_ce:.4f} | "
             f"Info: {epoch_information:.4f} | "
@@ -1272,11 +1451,61 @@ def plot_summary_table(
 # MAIN
 # =========================================================
 
-def main():
+def run_mode(training_mode):
+    """
+    Run the full pipeline (train all divergences, evaluate,
+    save metrics and plots) for ONE training mode. All
+    artifacts are routed to that mode's subfolder under
+    results/<dataset>/.
+    """
 
     run_start = time.time()
 
     set_seed(SEED)
+
+    set_output_dirs(training_mode)
+
+    tag = TRAINING_MODE_TAGS[training_mode]
+
+
+    print("\n")
+    print("#" * 60)
+    print(
+        f"TRAINING MODE: {training_mode.upper()} "
+        f"(results -> results/{DATASET_NAME}/{tag}/)"
+    )
+    if training_mode != "clean":
+
+        print(
+            f"  Adversarial training eps: "
+            f"{ADV_TRAIN_EPSILON:.4f}"
+        )
+        if training_mode == "pgd":
+
+            print(
+                f"  Adversarial training PGD steps: "
+                f"{ADV_TRAIN_PGD_STEPS}"
+            )
+
+    print("#" * 60)
+
+
+    # -----------------------------------------------------
+    # Epoch budget for this mode (optional override for the
+    # costlier adversarial variants).
+    # -----------------------------------------------------
+
+    if training_mode == "clean":
+
+        epochs_for_mode = EPOCHS
+
+    elif ADV_TRAIN_EPOCHS_OVERRIDE is not None:
+
+        epochs_for_mode = ADV_TRAIN_EPOCHS_OVERRIDE
+
+    else:
+
+        epochs_for_mode = EPOCHS
 
 
     all_results = {}
@@ -1293,7 +1522,8 @@ def main():
         print("=" * 60)
 
         print(
-            f"TRAINING {divergence.upper()} VIB"
+            f"TRAINING {divergence.upper()} VIB "
+            f"[{training_mode.upper()}]"
         )
 
         print("=" * 60)
@@ -1318,7 +1548,9 @@ def main():
 
         history = train_model(
             model,
-            divergence
+            divergence,
+            training_mode=training_mode,
+            epochs=epochs_for_mode
         )
 
         histories[divergence] = history
@@ -1626,12 +1858,282 @@ def main():
         f"Metrics saved to: {METRICS_DIR}"
     )
 
-    total_minutes = (
+    mode_minutes = (
         time.time() - run_start
     ) / 60.0
 
     print(
-        f"\nTotal runtime: "
+        f"\n[{training_mode.upper()}] "
+        f"Mode runtime: "
+        f"{mode_minutes:.1f} min "
+        f"({mode_minutes / 60.0:.2f} h)"
+    )
+
+    print(
+        f"\nTraining mode '{training_mode}' completed."
+    )
+
+
+    return all_results
+
+
+# =========================================================
+# CROSS-MODE COMPARISON (clean vs FGSM-adv vs PGD-adv)
+# =========================================================
+
+def save_adversarial_training_comparison(
+    mode_summaries
+):
+    """
+    Aggregate the per-mode results into one table answering:
+
+        "Does adversarial training help, and which inner
+         maximization (FGSM vs PGD) helps more?"
+
+    For every divergence x training mode it reports clean
+    accuracy plus FGSM/PGD attack accuracy at the reference
+    epsilon (the evaluation epsilon closest to the training
+    budget ADV_TRAIN_EPSILON).
+    """
+
+    reference_epsilon = min(
+        EPSILONS,
+        key=lambda e: abs(e - ADV_TRAIN_EPSILON)
+    )
+
+    rows = []
+
+    for training_mode in TRAINING_MODES:
+
+        results = mode_summaries.get(training_mode)
+
+        if results is None:
+
+            continue
+
+        for divergence in DIVERGENCES:
+
+            if divergence not in results:
+
+                continue
+
+            entry = results[divergence]
+
+            rows.append({
+                "training_mode": (
+                    TRAINING_MODE_TAGS[training_mode]
+                ),
+                "divergence": divergence,
+                "train_epsilon": (
+                    ADV_TRAIN_EPSILON
+                    if training_mode != "clean"
+                    else 0.0
+                ),
+                "clean_accuracy": (
+                    entry["clean_accuracy"]
+                ),
+                "fgsm_accuracy": (
+                    entry["adversarial"]
+                    [reference_epsilon]
+                    ["fgsm_accuracy"]
+                ),
+                "pgd_accuracy": (
+                    entry["adversarial"]
+                    [reference_epsilon]
+                    ["pgd_accuracy"]
+                )
+            })
+
+
+    comparison_df = pd.DataFrame(rows)
+
+    comparison_csv_path = os.path.join(
+        RESULTS_DIR,
+        "adversarial_training_comparison.csv"
+    )
+
+    comparison_df.to_csv(
+        comparison_csv_path,
+        index=False
+    )
+
+    print("\n")
+    print("=" * 60)
+    print(
+        "ADVERSARIAL TRAINING COMPARISON "
+        f"(eval epsilon = {reference_epsilon:.3f})"
+    )
+    print("=" * 60)
+
+    print(
+        comparison_df.to_string(
+            index=False
+        )
+    )
+
+    print(
+        f"\nComparison CSV saved: "
+        f"{comparison_csv_path}"
+    )
+
+
+    # -----------------------------------------------------
+    # Grouped bar chart: robustness by training mode
+    # -----------------------------------------------------
+
+    os.makedirs(
+        os.path.join(RESULTS_DIR, "plots"),
+        exist_ok=True
+    )
+
+    tags = [
+        TRAINING_MODE_TAGS[m]
+        for m in TRAINING_MODES
+        if m in mode_summaries
+    ]
+
+    bar_colors = {
+        "standard": "#90A4AE",
+        "advtrain_fgsm": "#FF9800",
+        "advtrain_pgd": "#4CAF50"
+    }
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(12, 5)
+    )
+
+    for ax, attack in zip(
+        axes,
+        ["fgsm_accuracy", "pgd_accuracy"]
+    ):
+
+        width = 0.25
+
+        for i, tag in enumerate(tags):
+
+            values = [
+
+                float(
+                    comparison_df[
+
+                        (comparison_df["training_mode"] == tag)
+
+                        & (comparison_df["divergence"] == div)
+
+                    ][attack].iloc[0]
+                )
+
+                for div in DIVERGENCES
+                if not comparison_df[
+
+                    (comparison_df["training_mode"] == tag)
+
+                    & (comparison_df["divergence"] == div)
+
+                ].empty
+            ]
+
+            labels = [
+                div for div in DIVERGENCES
+                if not comparison_df[
+
+                    (comparison_df["training_mode"] == tag)
+
+                    & (comparison_df["divergence"] == div)
+
+                ].empty
+            ]
+
+            positions = [
+                j + i * width - width
+                for j in range(len(values))
+            ]
+
+            ax.bar(
+                positions,
+                values,
+                width=width,
+                label=tag,
+                color=bar_colors.get(tag)
+            )
+
+        ax.set_xticks(range(len(DIVERGENCES)))
+
+        ax.set_xticklabels(
+            [d.upper() for d in DIVERGENCES]
+        )
+
+        ax.set_ylim(0, 1.0)
+
+        ax.set_ylabel("Accuracy")
+
+        ax.set_title(
+            f"Robustness under {attack.split('_')[0].upper()} "
+            f"(eps={reference_epsilon:.3f})"
+        )
+
+        ax.legend()
+
+    plt.tight_layout()
+
+    comparison_plot_path = os.path.join(
+        RESULTS_DIR,
+        "plots",
+        "adversarial_training_comparison.png"
+    )
+
+    plt.savefig(
+        comparison_plot_path,
+        dpi=150,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    print(
+        f"Comparison plot saved: "
+        f"{comparison_plot_path}"
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    overall_start = time.time()
+
+    print("\n")
+    print("=" * 60)
+    print(
+        f"ADVERSARIAL TRAINING PIPELINE | modes: "
+        f"{', '.join(TRAINING_MODES)}"
+    )
+    print("=" * 60)
+
+
+    mode_summaries = {}
+
+    for training_mode in TRAINING_MODES:
+
+        mode_summaries[training_mode] = run_mode(
+            training_mode
+        )
+
+
+    save_adversarial_training_comparison(
+        mode_summaries
+    )
+
+    total_minutes = (
+        time.time() - overall_start
+    ) / 60.0
+
+    print(
+        f"\nTotal pipeline runtime: "
         f"{total_minutes:.1f} min "
         f"({total_minutes / 60.0:.2f} h)"
     )

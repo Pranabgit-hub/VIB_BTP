@@ -232,6 +232,218 @@ def pgd_attack(
 
 
 # =========================================================
+# TRAINING-TIME ADVERSARIAL EXAMPLE GENERATION
+#
+# Used for ADVERSARIAL TRAINING (not evaluation).
+# Same inner-maximization logic as the eval attacks above,
+# with three differences that matter during training:
+#
+#   1. torch.autograd.grad(loss, images) is used instead of
+#      loss.backward(), so parameter .grad buffers are never
+#      touched — the optimizer step that follows only sees
+#      gradients from the actual training loss.
+#
+#   2. The model is temporarily switched to eval mode while
+#      crafting examples, so BatchNorm running statistics are
+#      not updated by these extra forward passes, then the
+#      previous mode is restored.
+#
+#   3. Supports both "fgsm" (single-step) and "pgd"
+#      (multi-step Madry-style) inner maximization, so the
+#      same entry point drives FGSM- and PGD-adversarial
+#      training.
+# =========================================================
+
+def generate_adversarial_batch(
+    model,
+    images,
+    labels,
+    epsilon,
+    device,
+    method="fgsm",
+    num_steps=5,
+    step_size=None
+):
+
+    if method not in ("fgsm", "pgd"):
+
+        raise ValueError(
+            f"Unknown adversarial-training method: {method}. "
+            f"Choose from: ['fgsm', 'pgd']"
+        )
+
+    was_training = model.training
+
+    model.eval()
+
+
+    try:
+
+        images = images.clone().detach().to(device)
+
+        labels = labels.clone().detach().to(device)
+
+        if method == "fgsm":
+
+            adversarial_images = _fgsm_inner_max(
+                model,
+                images,
+                labels,
+                epsilon
+            )
+
+        else:
+
+            adversarial_images = _pgd_inner_max(
+                model,
+                images,
+                labels,
+                epsilon,
+                num_steps=num_steps,
+                step_size=step_size
+            )
+
+
+    finally:
+
+        if was_training:
+
+            model.train()
+
+
+    return adversarial_images.detach()
+
+
+def _fgsm_inner_max(
+    model,
+    images,
+    labels,
+    epsilon
+):
+    """
+    One-step inner maximization (FGSM).
+    """
+
+    perturbed = images.clone().detach()
+
+    perturbed.requires_grad_(True)
+
+
+    mu, logvar = model.encode(perturbed)
+
+    logits = model.classifier(mu)
+
+    loss = F.cross_entropy(logits, labels)
+
+
+    data_grad = torch.autograd.grad(
+        loss,
+        perturbed
+    )[0]
+
+
+    adversarial_images = (
+        images + epsilon * data_grad.sign()
+    )
+
+    return torch.clamp(
+        adversarial_images,
+        0.0,
+        1.0
+    )
+
+
+def _pgd_inner_max(
+    model,
+    images,
+    labels,
+    epsilon,
+    num_steps=5,
+    step_size=None
+):
+    """
+    Multi-step inner maximization (PGD, random start).
+
+    Default step size epsilon / 4 — for CIFAR-10 at
+    eps = 8/255 this equals 2/255, the standard Madry
+    recipe.
+    """
+
+    if step_size is None:
+
+        step_size = epsilon / 4.0
+
+
+    # Random start inside the epsilon ball
+    adversarial_images = (
+        images
+        + torch.empty_like(images).uniform_(
+            -epsilon,
+            epsilon
+        )
+    )
+
+    adversarial_images = torch.clamp(
+        adversarial_images,
+        0.0,
+        1.0
+    )
+
+
+    for _ in range(num_steps):
+
+        perturbed = adversarial_images.clone().detach()
+
+        perturbed.requires_grad_(True)
+
+
+        mu, logvar = model.encode(perturbed)
+
+        logits = model.classifier(mu)
+
+        loss = F.cross_entropy(logits, labels)
+
+
+        data_grad = torch.autograd.grad(
+            loss,
+            perturbed
+        )[0]
+
+
+        # Gradient ascent step
+        adversarial_images = (
+            adversarial_images.detach()
+            + step_size * data_grad.sign()
+        )
+
+
+        # Project onto the epsilon ball around x
+        perturbation = (
+            adversarial_images - images
+        )
+
+        perturbation = torch.clamp(
+            perturbation,
+            -epsilon,
+            epsilon
+        )
+
+        adversarial_images = (
+            images + perturbation
+        )
+
+
+        adversarial_images = torch.clamp(
+            adversarial_images,
+            0.0,
+            1.0
+        )
+
+
+    return adversarial_images
+
+
+# =========================================================
 # EVALUATE UNDER ATTACK
 # =========================================================
 
