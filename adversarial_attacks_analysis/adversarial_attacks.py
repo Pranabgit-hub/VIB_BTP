@@ -28,13 +28,13 @@ def fgsm_attack(
 
     Args:
         model:    trained VIB model
-        images:   input images, shape (B, 784)
+        images:   inputs in model input format — flat (B, D) or image (B, C, H, W)
         labels:   true labels, shape (B,)
         epsilon:  perturbation magnitude
         device:   torch device
 
     Returns:
-        adversarial_images: perturbed inputs, shape (B, 784)
+        adversarial_images: perturbed inputs, same shape as images
     """
 
     images = images.clone().detach().to(device)
@@ -122,7 +122,7 @@ def pgd_attack(
 
     Args:
         model:      trained VIB model
-        images:     input images, shape (B, 784)
+        images:     inputs in model input format — flat (B, D) or image (B, C, H, W)
         labels:     true labels, shape (B,)
         epsilon:    maximum perturbation magnitude
         device:     torch device
@@ -130,7 +130,7 @@ def pgd_attack(
         step_size:  per-step size (default: epsilon / 4)
 
     Returns:
-        adversarial_images: perturbed inputs, shape (B, 784)
+        adversarial_images: perturbed inputs, same shape as images
     """
 
     if step_size is None:
@@ -249,6 +249,11 @@ def evaluate_under_attack(
     sampling) for both attack generation and accuracy
     evaluation.
 
+    Batches from test_loader are used exactly as yielded
+    — the loader's collate_fn is responsible for putting
+    them in the model's expected input format (flattened
+    vectors for the MLP, image tensors for the CNN).
+
     Args:
         model:        trained VIB model (in eval mode)
         attack_fn:    callable(model, images, labels, epsilon, device)
@@ -268,10 +273,7 @@ def evaluate_under_attack(
 
     for images, labels in test_loader:
 
-        images = images.view(
-            images.size(0),
-            -1
-        ).to(device)
+        images = images.to(device)
 
         labels = labels.to(device)
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import random
 
 import numpy as np
@@ -8,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 
@@ -36,7 +37,7 @@ sys.path.insert(
 # IMPORTS
 # =========================================================
 
-from model import VIB
+from model import build_vib
 
 from divergences import divergence_loss
 
@@ -59,11 +60,31 @@ from adversarial_attacks import (
 
 # =========================================================
 # CONFIGURATION
+#
+# Global defaults below apply to every dataset. Individual
+# datasets may override them via optional keys in
+# DATASET_REGISTRY (see "epochs" / "hidden_dim" /
+# "latent_dim" / "epsilons" / "batch_size" overrides).
 # =========================================================
 
 BATCH_SIZE = 128
 
 EPOCHS = 20
+
+# ---------------------------------------------------------
+# Compute-load control
+#
+# Fractions of the train/test splits actually used.
+#
+# 1.0 = full dataset (original behaviour).
+# Values < 1.0 subsample reproducibly (seeded) so the run
+# finishes on CPU within practical time limits.
+# Set back to 1.0 for final full-data experiments.
+# ---------------------------------------------------------
+
+TRAIN_SUBSET_FRACTION = 1.0
+
+TEST_SUBSET_FRACTION = 1.0
 
 LEARNING_RATE = 1e-3
 
@@ -71,24 +92,73 @@ BETA = 1e-3
 
 LATENT_DIM = 32
 
+HIDDEN_DIM = 256
+
 # ---------------------------------------------------------
-# Dataset switch
+# Dataset switch + registry
 #
-# Change DATASET_NAME to "mnist" or "cifar10" to switch
-# datasets. Everything else (input_dim, results folders)
-# follows automatically from this one setting.
+# To ADD A NEW DATASET: add one entry to DATASET_REGISTRY
+# and set DATASET_NAME above. Nothing else changes.
+#
+# Required keys per entry:
+#   dataset_class    torchvision dataset class
+#   input_shape      (C, H, W)
+#   flatten          True -> batches flattened to (B, C*H*W)
+#                    for the MLP; False -> image tensors for CNN
+#   arch             "mlp" or "cnn" (key of ARCH_REGISTRY)
+#   num_classes      number of output classes
+#   train_transform  augmentation/preprocessing (train split)
+#   test_transform   preprocessing (test split — keep clean,
+#                    no augmentation, so adversarial eval is fair)
+#
+# Optional keys (override global defaults):
+#   epochs, batch_size, hidden_dim, latent_dim, epsilons,
+#   train_subset_fraction, test_subset_fraction
 # ---------------------------------------------------------
 
 DATASET_NAME = "cifar10"
 
 DATASET_REGISTRY = {
+
     "mnist": {
         "dataset_class": datasets.MNIST,
-        "input_dim": 28 * 28 * 1,
+        "input_shape": (1, 28, 28),
+        "flatten": True,
+        "arch": "mlp",
+        "num_classes": 10,
+        "train_transform": transforms.ToTensor(),
+        "test_transform": transforms.ToTensor(),
     },
+
     "cifar10": {
         "dataset_class": datasets.CIFAR10,
-        "input_dim": 32 * 32 * 3,
+        "input_shape": (3, 32, 32),
+        "flatten": False,
+        "arch": "cnn",
+        "num_classes": 10,
+        "train_transform": transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]),
+        "test_transform": transforms.ToTensor(),
+        # ---- CIFAR-10 specific tuning ----
+        #
+        # CPU-friendly balanced load:
+        #   15 epochs on a reproducible 40% train subset
+        #   (20k images), batch 256 -> ~79 batches/epoch.
+        #   Adversarial eval uses a 50% test subset (5k)
+        #   and PGD steps are halved globally below.
+        # Roughly an order of magnitude faster than the
+        # original 50-epoch full-data configuration while
+        # preserving the qualitative comparison.
+        "epochs": 15,
+        "batch_size": 256,
+        "hidden_dim": 256,
+        "latent_dim": 64,
+        "train_subset_fraction": 0.4,
+        "test_subset_fraction": 0.5,
+        "epsilons": [0.02, 0.031, 0.05, 0.08, 0.12],
     },
 }
 
@@ -98,7 +168,47 @@ if DATASET_NAME not in DATASET_REGISTRY:
         f"Choose from: {list(DATASET_REGISTRY.keys())}"
     )
 
-INPUT_DIM = DATASET_REGISTRY[DATASET_NAME]["input_dim"]
+DATASET_CONFIG = DATASET_REGISTRY[DATASET_NAME]
+
+INPUT_SHAPE = DATASET_CONFIG["input_shape"]
+
+FLATTEN_INPUTS = DATASET_CONFIG["flatten"]
+
+ARCHITECTURE = DATASET_CONFIG["arch"]
+
+NUM_CLASSES = DATASET_CONFIG["num_classes"]
+
+INPUT_DIM = 1
+
+for _dim in INPUT_SHAPE:
+
+    INPUT_DIM *= _dim
+
+
+# Per-dataset hyperparameter overrides
+
+EPOCHS = DATASET_CONFIG.get("epochs", EPOCHS)
+
+BATCH_SIZE = DATASET_CONFIG.get("batch_size", BATCH_SIZE)
+
+TRAIN_SUBSET_FRACTION = DATASET_CONFIG.get(
+    "train_subset_fraction",
+    TRAIN_SUBSET_FRACTION
+)
+
+TEST_SUBSET_FRACTION = DATASET_CONFIG.get(
+    "test_subset_fraction",
+    TEST_SUBSET_FRACTION
+)
+
+HIDDEN_DIM = DATASET_CONFIG.get("hidden_dim", HIDDEN_DIM)
+
+LATENT_DIM = DATASET_CONFIG.get("latent_dim", LATENT_DIM)
+
+
+TRAIN_TRANSFORM = DATASET_CONFIG["train_transform"]
+
+TEST_TRANSFORM = DATASET_CONFIG["test_transform"]
 
 
 # ---------------------------------------------------------
@@ -122,9 +232,13 @@ DIVERGENCES = [
 
 # ---------------------------------------------------------
 # Adversarial attack configuration
+#
+# Datasets may override the epsilon list via the optional
+# "epsilons" registry key (CIFAR-10 uses a smaller range:
+# standard CIFAR-10 PGD evaluation is eps=8/255 ~= 0.031).
 # ---------------------------------------------------------
 
-EPSILONS = [
+DEFAULT_EPSILONS = [
     0.05,
     0.1,
     0.15,
@@ -132,7 +246,12 @@ EPSILONS = [
     0.3
 ]
 
-PGD_STEPS = 20
+EPSILONS = DATASET_CONFIG.get(
+    "epsilons",
+    DEFAULT_EPSILONS
+)
+
+PGD_STEPS = 10
 
 PGD_STEP_SIZE = None  # defaults to epsilon / 4
 
@@ -224,7 +343,30 @@ print(
 )
 
 print(
+    f"Train subset: "
+    f"{TRAIN_SUBSET_FRACTION:.0%}"
+)
+
+print(
+    f"Test subset: "
+    f"{TEST_SUBSET_FRACTION:.0%}"
+)
+
+print(
     f"Dataset: {DATASET_NAME}"
+)
+
+print(
+    f"Architecture: {ARCHITECTURE}"
+)
+
+print(
+    f"Input shape: {INPUT_SHAPE} "
+    f"(flatten={FLATTEN_INPUTS})"
+)
+
+print(
+    f"Num classes: {NUM_CLASSES}"
 )
 
 print(
@@ -232,7 +374,11 @@ print(
 )
 
 print(
-    f"Input dim: {INPUT_DIM}"
+    f"Hidden dim: {HIDDEN_DIM}"
+)
+
+print(
+    f"Latent dim: {LATENT_DIM}"
 )
 
 print(
@@ -260,12 +406,46 @@ print("=" * 60)
 
 # =========================================================
 # DATASET
+#
+# Flattening is handled once, here, via collate_fn. Every
+# downstream consumer (training loop, clean eval, attacks)
+# receives batches already in the model's input format, so
+# no other file needs dataset-specific shape logic.
 # =========================================================
 
-transform = transforms.ToTensor()
+def make_collate(flatten):
+    """
+    Build a collate_fn that stacks a batch and optionally
+    flattens images to (B, C*H*W) for MLP models.
+    """
+
+    def _collate(batch):
+
+        images = torch.stack(
+            [item[0] for item in batch]
+        )
+
+        labels = torch.tensor(
+            [item[1] for item in batch],
+            dtype=torch.long
+        )
+
+        if flatten:
+
+            images = images.view(
+                images.size(0),
+                -1
+            )
+
+        return images, labels
+
+    return _collate
 
 
-dataset_cls = DATASET_REGISTRY[DATASET_NAME]["dataset_class"]
+_collate_fn = make_collate(FLATTEN_INPUTS)
+
+
+dataset_cls = DATASET_CONFIG["dataset_class"]
 
 
 train_dataset = dataset_cls(
@@ -275,7 +455,7 @@ train_dataset = dataset_cls(
     ),
     train=True,
     download=True,
-    transform=transform
+    transform=TRAIN_TRANSFORM
 )
 
 
@@ -286,21 +466,67 @@ test_dataset = dataset_cls(
     ),
     train=False,
     download=True,
-    transform=transform
+    transform=TEST_TRANSFORM
+)
+
+
+# ---------------------------------------------------------
+# Reproducible subsampling (compute-load control)
+#
+# A seeded generator picks the subset indices, so the same
+# fractions always yield the same splits across runs and
+# across divergences — the comparison stays fair.
+# ---------------------------------------------------------
+
+def make_subset(dataset, fraction):
+
+    if fraction >= 1.0:
+
+        return dataset
+
+    num_keep = int(
+        len(dataset) * fraction
+    )
+
+    generator = torch.Generator().manual_seed(SEED)
+
+    indices = torch.randperm(
+        len(dataset),
+        generator=generator
+    )[:num_keep].tolist()
+
+    print(
+        f"Subset: using {num_keep}/{len(dataset)} "
+        f"samples ({fraction:.0%})"
+    )
+
+    return Subset(dataset, indices)
+
+
+train_dataset = make_subset(
+    train_dataset,
+    TRAIN_SUBSET_FRACTION
+)
+
+test_dataset = make_subset(
+    test_dataset,
+    TEST_SUBSET_FRACTION
 )
 
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
-    shuffle=True
+    shuffle=True,
+    collate_fn=_collate_fn
 )
 
 
 test_loader = DataLoader(
     test_dataset,
     batch_size=BATCH_SIZE,
-    shuffle=False
+    shuffle=False,
+    collate_fn=_collate_fn
 )
 
 
@@ -318,10 +544,23 @@ def train_model(
         lr=LEARNING_RATE
     )
 
+    # Cosine annealing: smooth decay to ~0 over training,
+    # improves convergence on harder datasets.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS
+    )
+
     history = []
+
+    train_start = time.time()
+
+    epoch_times = []
 
 
     for epoch in range(EPOCHS):
+
+        epoch_start = time.time()
 
         model.train()
 
@@ -334,10 +573,7 @@ def train_model(
 
         for images, labels in train_loader:
 
-            images = images.view(
-                images.size(0),
-                -1
-            ).to(device)
+            images = images.to(device)
 
             labels = labels.to(device)
 
@@ -449,6 +685,23 @@ def train_model(
         )
 
 
+        epoch_time = time.time() - epoch_start
+
+        epoch_times.append(epoch_time)
+
+        elapsed = time.time() - train_start
+
+        avg_epoch = (
+            sum(epoch_times) / len(epoch_times)
+        )
+
+        eta_seconds = (
+            avg_epoch * (EPOCHS - epoch - 1)
+        )
+
+        eta_minutes = eta_seconds / 60.0
+
+
         history.append({
 
             "epoch":
@@ -470,8 +723,26 @@ def train_model(
             f"Epoch {epoch + 1:02d}/{EPOCHS} | "
             f"Loss: {epoch_loss:.4f} | "
             f"CE: {epoch_ce:.4f} | "
-            f"Info: {epoch_information:.4f}"
+            f"Info: {epoch_information:.4f} | "
+            f"Time: {epoch_time:.1f}s | "
+            f"ETA: {eta_minutes:.1f} min",
+            flush=True
         )
+
+
+        scheduler.step()
+
+
+    total_train_minutes = (
+        time.time() - train_start
+    ) / 60.0
+
+    print(
+        f"[{divergence.upper():7s}] "
+        f"Training finished in "
+        f"{total_train_minutes:.1f} min",
+        flush=True
+    )
 
 
     return history
@@ -507,10 +778,7 @@ def evaluate_clean(
 
         for images, labels in test_loader:
 
-            images = images.view(
-                images.size(0),
-                -1
-            ).to(device)
+            images = images.to(device)
 
             labels = labels.to(device)
 
@@ -577,7 +845,8 @@ def run_adversarial_evaluation(
 
         print(
             f"\n  [{divergence_name.upper()}] "
-            f"FGSM epsilon={epsilon:.2f} ..."
+            f"FGSM epsilon={epsilon:.2f} ...",
+            flush=True
         )
 
         fgsm_accuracy = evaluate_under_attack(
@@ -597,7 +866,8 @@ def run_adversarial_evaluation(
         print(
             f"  [{divergence_name.upper()}] "
             f"PGD epsilon={epsilon:.2f} "
-            f"(steps={PGD_STEPS}) ..."
+            f"(steps={PGD_STEPS}) ...",
+            flush=True
         )
 
         def pgd_attack_fn(
@@ -665,7 +935,7 @@ def plot_clean_accuracy(
 
     plt.ylabel("Accuracy")
     plt.title("Clean Accuracy by Divergence")
-    plt.ylim(0.9, 1.0)
+    plt.ylim(0, 1.0)
 
     plt.tight_layout()
 
@@ -1004,6 +1274,8 @@ def plot_summary_table(
 
 def main():
 
+    run_start = time.time()
+
     set_seed(SEED)
 
 
@@ -1013,6 +1285,8 @@ def main():
 
 
     for divergence in DIVERGENCES:
+
+        divergence_start = time.time()
 
         print("\n")
 
@@ -1029,9 +1303,12 @@ def main():
         # Fresh model
         # -------------------------------------------------
 
-        model = VIB(
-            input_dim=INPUT_DIM,
-            latent_dim=LATENT_DIM
+        model = build_vib(
+            arch=ARCHITECTURE,
+            input_shape=INPUT_SHAPE,
+            hidden_dim=HIDDEN_DIM,
+            latent_dim=LATENT_DIM,
+            num_classes=NUM_CLASSES
         ).to(device)
 
 
@@ -1051,8 +1328,11 @@ def main():
         # Clean evaluation
         # -------------------------------------------------
 
+        clean_eval_start = time.time()
+
         print(
-            f"\n  Evaluating clean accuracy ..."
+            f"\n  Evaluating clean accuracy ...",
+            flush=True
         )
 
         clean_eval = evaluate_clean(
@@ -1060,9 +1340,15 @@ def main():
             divergence
         )
 
+        clean_eval_minutes = (
+            time.time() - clean_eval_start
+        ) / 60.0
+
         print(
             f"  Clean accuracy: "
-            f"{clean_eval['accuracy']:.4f}"
+            f"{clean_eval['accuracy']:.4f} "
+            f"({clean_eval_minutes:.1f} min)",
+            flush=True
         )
 
 
@@ -1081,7 +1367,7 @@ def main():
 
                 logits=clean_eval["logits"],
 
-                num_classes=10,
+                num_classes=NUM_CLASSES,
 
                 beta=BETA
             )
@@ -1102,8 +1388,11 @@ def main():
         # Adversarial evaluation
         # -------------------------------------------------
 
+        adversarial_start = time.time()
+
         print(
-            f"\n  Running adversarial attacks ..."
+            f"\n  Running adversarial attacks ...",
+            flush=True
         )
 
         adversarial_results = (
@@ -1111,6 +1400,30 @@ def main():
                 model,
                 divergence
             )
+        )
+
+        adversarial_minutes = (
+            time.time() - adversarial_start
+        ) / 60.0
+
+        divergence_minutes = (
+            time.time() - divergence_start
+        ) / 60.0
+
+        elapsed_minutes = (
+            time.time() - run_start
+        ) / 60.0
+
+
+        print(
+            f"\n  [{divergence.upper()}] "
+            f"Adversarial eval: "
+            f"{adversarial_minutes:.1f} min | "
+            f"Divergence total: "
+            f"{divergence_minutes:.1f} min | "
+            f"Overall elapsed: "
+            f"{elapsed_minutes:.1f} min",
+            flush=True
         )
 
 
@@ -1311,6 +1624,16 @@ def main():
 
     print(
         f"Metrics saved to: {METRICS_DIR}"
+    )
+
+    total_minutes = (
+        time.time() - run_start
+    ) / 60.0
+
+    print(
+        f"\nTotal runtime: "
+        f"{total_minutes:.1f} min "
+        f"({total_minutes / 60.0:.2f} h)"
     )
 
     print(
