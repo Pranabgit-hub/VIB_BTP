@@ -11,7 +11,8 @@ def fgsm_attack(
     images,
     labels,
     epsilon,
-    device
+    device,
+    clamp_output=True
 ):
     """
     Fast Gradient Sign Method (FGSM).
@@ -27,11 +28,13 @@ def fgsm_attack(
     is not confused by stochastic sampling.
 
     Args:
-        model:    trained VIB model
-        images:   inputs in model input format — flat (B, D) or image (B, C, H, W)
-        labels:   true labels, shape (B,)
-        epsilon:  perturbation magnitude
-        device:   torch device
+        model:        trained VIB model
+        images:       inputs in model input format — flat (B, D) or image (B, C, H, W)
+        labels:       true labels, shape (B,)
+        epsilon:      perturbation magnitude
+        device:       torch device
+        clamp_output: if True clamp to [0, 1] (images);
+                      if False leave unperturbed (time series)
 
     Returns:
         adversarial_images: perturbed inputs, same shape as images
@@ -82,12 +85,13 @@ def fgsm_attack(
         + epsilon * sign_data_grad
     )
 
-    # Clamp to valid pixel range [0, 1]
-    adversarial_images = torch.clamp(
-        adversarial_images,
-        0.0,
-        1.0
-    )
+    # Clamp to valid pixel range [0, 1] only for images
+    if clamp_output:
+        adversarial_images = torch.clamp(
+            adversarial_images,
+            0.0,
+            1.0
+        )
 
     return adversarial_images.detach()
 
@@ -103,7 +107,8 @@ def pgd_attack(
     epsilon,
     device,
     num_steps=20,
-    step_size=None
+    step_size=None,
+    clamp_output=True
 ):
     """
     Projected Gradient Descent (PGD) attack.
@@ -121,13 +126,15 @@ def pgd_attack(
     clean gradient signal.
 
     Args:
-        model:      trained VIB model
-        images:     inputs in model input format — flat (B, D) or image (B, C, H, W)
-        labels:     true labels, shape (B,)
-        epsilon:    maximum perturbation magnitude
-        device:     torch device
-        num_steps:  number of PGD iterations
-        step_size:  per-step size (default: epsilon / 4)
+        model:        trained VIB model
+        images:       inputs in model input format — flat (B, D) or image (B, C, H, W)
+        labels:       true labels, shape (B,)
+        epsilon:      maximum perturbation magnitude
+        device:       torch device
+        num_steps:    number of PGD iterations
+        step_size:    per-step size (default: epsilon / 4)
+        clamp_output: if True clamp to [0, 1] (images);
+                      if False leave unperturbed (time series)
 
     Returns:
         adversarial_images: perturbed inputs, same shape as images
@@ -156,11 +163,12 @@ def pgd_attack(
         )
     )
 
-    adversarial_images = torch.clamp(
-        adversarial_images,
-        0.0,
-        1.0
-    )
+    if clamp_output:
+        adversarial_images = torch.clamp(
+            adversarial_images,
+            0.0,
+            1.0
+        )
 
 
     # -------------------------------------------------
@@ -221,11 +229,12 @@ def pgd_attack(
 
 
         # Clamp to valid pixel range
-        adversarial_images = torch.clamp(
-            adversarial_images,
-            0.0,
-            1.0
-        )
+        if clamp_output:
+            adversarial_images = torch.clamp(
+                adversarial_images,
+                0.0,
+                1.0
+            )
 
 
     return adversarial_images.detach()
@@ -262,7 +271,8 @@ def generate_adversarial_batch(
     device,
     method="fgsm",
     num_steps=5,
-    step_size=None
+    step_size=None,
+    clamp_output=True
 ):
 
     if method not in ("fgsm", "pgd"):
@@ -289,7 +299,8 @@ def generate_adversarial_batch(
                 model,
                 images,
                 labels,
-                epsilon
+                epsilon,
+                clamp_output
             )
 
         else:
@@ -300,7 +311,8 @@ def generate_adversarial_batch(
                 labels,
                 epsilon,
                 num_steps=num_steps,
-                step_size=step_size
+                step_size=step_size,
+                clamp_output=clamp_output
             )
 
 
@@ -318,7 +330,8 @@ def _fgsm_inner_max(
     model,
     images,
     labels,
-    epsilon
+    epsilon,
+    clamp_output=True
 ):
     """
     One-step inner maximization (FGSM).
@@ -346,11 +359,14 @@ def _fgsm_inner_max(
         images + epsilon * data_grad.sign()
     )
 
-    return torch.clamp(
-        adversarial_images,
-        0.0,
-        1.0
-    )
+    if clamp_output:
+        return torch.clamp(
+            adversarial_images,
+            0.0,
+            1.0
+        )
+
+    return adversarial_images
 
 
 def _pgd_inner_max(
@@ -359,7 +375,8 @@ def _pgd_inner_max(
     labels,
     epsilon,
     num_steps=5,
-    step_size=None
+    step_size=None,
+    clamp_output=True
 ):
     """
     Multi-step inner maximization (PGD, random start).
@@ -383,11 +400,12 @@ def _pgd_inner_max(
         )
     )
 
-    adversarial_images = torch.clamp(
-        adversarial_images,
-        0.0,
-        1.0
-    )
+    if clamp_output:
+        adversarial_images = torch.clamp(
+            adversarial_images,
+            0.0,
+            1.0
+        )
 
 
     for _ in range(num_steps):
@@ -452,7 +470,8 @@ def evaluate_under_attack(
     attack_fn,
     test_loader,
     epsilon,
-    device
+    device,
+    clamp_output=True
 ):
     """
     Evaluate a model's accuracy under a given attack.
@@ -472,6 +491,7 @@ def evaluate_under_attack(
         test_loader:  DataLoader for test set
         epsilon:      perturbation magnitude
         device:       torch device
+        clamp_output: passed through to attack_fn
 
     Returns:
         accuracy: float, adversarial accuracy
@@ -496,7 +516,8 @@ def evaluate_under_attack(
             images,
             labels,
             epsilon,
-            device
+            device,
+            clamp_output=clamp_output
         )
 
 

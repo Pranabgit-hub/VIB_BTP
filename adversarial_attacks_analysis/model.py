@@ -292,6 +292,164 @@ class VIBCNN(VIBBase):
 
 
 # =========================================================
+# 1D ResNet VARIANT  (time-series inputs, e.g. FordA)
+#
+# ResNet-18-style architecture adapted for 1-D signals:
+#   Initial Conv1d -> 4 stages of residual blocks
+#   -> Global Average Pooling -> VIB bottleneck
+#
+# Input: (B, in_channels, seq_len)
+#   e.g. FordA: (B, 1, 500)
+# =========================================================
+
+
+class _ResBlock1D(nn.Module):
+    """Basic 1-D residual block: two Conv1d + BN + ReLU
+    with a skip connection."""
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(
+            in_channels, out_channels,
+            kernel_size=7,
+            stride=stride,
+            padding=3,
+            bias=False
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv1d(
+            out_channels, out_channels,
+            kernel_size=7,
+            stride=1,
+            padding=3,
+            bias=False
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(
+                    in_channels, out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False
+                ),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        return self.relu(out)
+
+
+class VIBResNet1D(VIBBase):
+    """
+    ResNet-18-style encoder for 1-D time-series,
+    wrapped with VIB bottleneck (mu / logvar / z).
+
+    Architecture:
+        Initial conv:  in_channels -> 64
+        Stage 1:  2 x ResBlock(64,  stride=1)
+        Stage 2:  2 x ResBlock(128, stride=2)
+        Stage 3:  2 x ResBlock(256, stride=2)
+        Stage 4:  2 x ResBlock(512, stride=2)
+        Global average pool over time -> 512-d
+        -> fc_hidden -> mu / logvar -> classifier
+    """
+
+    def __init__(
+        self,
+        seq_len=500,
+        in_channels=1,
+        hidden_dim=256,
+        latent_dim=32,
+        num_classes=10
+    ):
+        super().__init__()
+
+        self.initial = nn.Sequential(
+            nn.Conv1d(
+                in_channels, 64,
+                kernel_size=15,
+                stride=1,
+                padding=7,
+                bias=False
+            ),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        self.stage1 = nn.Sequential(
+            _ResBlock1D(64, 64, stride=1),
+            _ResBlock1D(64, 64, stride=1),
+        )
+
+        self.stage2 = nn.Sequential(
+            _ResBlock1D(64, 128, stride=2),
+            _ResBlock1D(128, 128, stride=1),
+        )
+
+        self.stage3 = nn.Sequential(
+            _ResBlock1D(128, 256, stride=2),
+            _ResBlock1D(256, 256, stride=1),
+        )
+
+        self.stage4 = nn.Sequential(
+            _ResBlock1D(256, 512, stride=2),
+            _ResBlock1D(512, 512, stride=1),
+        )
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+
+        self.fc_hidden = nn.Sequential(
+            nn.Linear(512, hidden_dim),
+            nn.ReLU(),
+        )
+
+        self.fc_mu = nn.Linear(
+            hidden_dim, latent_dim
+        )
+
+        self.fc_logvar = nn.Linear(
+            hidden_dim, latent_dim
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def encode(self, x):
+
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+
+        h = self.initial(x)
+        h = self.stage1(h)
+        h = self.stage2(h)
+        h = self.stage3(h)
+        h = self.stage4(h)
+
+        h = self.gap(h).squeeze(-1)
+
+        h = self.fc_hidden(h)
+
+        mu = self.fc_mu(h)
+        logvar = clamp_logvar(
+            self.fc_logvar(h)
+        )
+
+        return mu, logvar
+
+
+# =========================================================
 # ARCHITECTURE REGISTRY
 #
 # run_analysis.py selects the architecture via the
@@ -303,6 +461,7 @@ class VIBCNN(VIBBase):
 ARCH_REGISTRY = {
     "mlp": VIBMLP,
     "cnn": VIBCNN,
+    "resnet1d": VIBResNet1D,
 }
 
 
@@ -311,7 +470,9 @@ def build_vib(
     input_shape=(1, 28, 28),
     hidden_dim=256,
     latent_dim=32,
-    num_classes=10
+    num_classes=10,
+    seq_len=None,
+    in_channels=None
 ):
     """
     Build a VIB model for the given architecture.
@@ -341,6 +502,16 @@ def build_vib(
 
         return arch_cls(
             input_shape=input_shape,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
+            num_classes=num_classes
+        )
+
+    if arch == "resnet1d":
+
+        return arch_cls(
+            seq_len=seq_len,
+            in_channels=in_channels,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             num_classes=num_classes

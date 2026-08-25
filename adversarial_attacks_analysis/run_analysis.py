@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import random
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 
@@ -57,6 +58,213 @@ from adversarial_attacks import (
     evaluate_under_attack,
     generate_adversarial_batch
 )
+
+
+# =========================================================
+# FORDA DATASET
+#
+# FordA is a binary time-series classification dataset
+# from the UCR archive (500 samples of length 500 each
+# in train/test, 2 classes).
+#
+# The .ts format stores one sample per line as space-
+# separated floats, with the class label as the last
+# value.  Lines starting with '@' are metadata headers.
+# =========================================================
+
+_FORDA_URL = (
+    "https://timeseriesclassification.com/"
+    "aeon-toolkit/FordA.zip"
+)
+
+
+def _parse_ts_file(path):
+    """
+    Read a UCR .ts file (aeon format).
+
+    Each line: "dim0_val0,dim0_val1,...,dim0_valT:class_label"
+    or space-separated values depending on source.
+
+    Returns (data: np.ndarray float32, shape (N, T),
+             labels: np.ndarray int64, shape (N,))
+    """
+
+    X, y = [], []
+
+    with open(path, "r") as fh:
+
+        for line in fh:
+
+            line = line.strip()
+
+            if (
+                not line
+                or line.startswith("@")
+                or line.startswith("#")
+            ):
+                continue
+
+            parts = line.split(":")
+
+            if len(parts) < 2:
+                continue
+
+            vals_str = parts[0]
+            label_str = parts[-1]
+
+            vals_str = vals_str.replace(",", " ")
+
+            values = [
+                float(v)
+                for v in vals_str.split()
+                if v != "?"
+            ]
+
+            label = int(float(label_str))
+
+            X.append(values)
+            y.append(label)
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(y, dtype=np.int64)
+    )
+
+
+class FordADataset(Dataset):
+    """
+    PyTorch Dataset wrapper around FordA .ts files.
+
+    Data is z-score normalised using training-set
+    statistics (mean, std) computed once and stored.
+    """
+
+    def __init__(self, X, y, mean=None, std=None):
+
+        self.X = torch.tensor(
+            X, dtype=torch.float32
+        ).unsqueeze(1)
+
+        self.y = torch.tensor(
+            y, dtype=torch.long
+        )
+
+        if mean is not None and std is not None:
+
+            self.X = (
+                (self.X - mean) / (std + 1e-8)
+            )
+
+        self.mean = mean
+        self.std = std
+
+    def __len__(self):
+
+        return len(self.y)
+
+    def __getitem__(self, idx):
+
+        return self.X[idx], self.y[idx]
+
+
+def load_forda(root):
+    """
+    Download (cached) and return
+    (train_dataset, test_dataset, seq_len).
+
+    Z-score normalisation is fitted on training data.
+    """
+
+    data_dir = os.path.join(root, "data", "forda")
+
+    os.makedirs(data_dir, exist_ok=True)
+
+    train_path = os.path.join(
+        data_dir, "FordA_TRAIN.ts"
+    )
+    test_path = os.path.join(
+        data_dir, "FordA_TEST.ts"
+    )
+
+    if not os.path.exists(train_path):
+
+        zip_path = os.path.join(
+            data_dir, "FordA.zip"
+        )
+
+        print(
+            "Downloading FordA dataset ..."
+        )
+
+        urllib.request.urlretrieve(
+            _FORDA_URL, zip_path
+        )
+
+        import zipfile
+
+        with zipfile.ZipFile(
+            zip_path, "r"
+        ) as zf:
+
+            zf.extractall(data_dir)
+
+        os.remove(zip_path)
+
+    X_train, y_train = _parse_ts_file(
+        train_path
+    )
+    X_test, y_test = _parse_ts_file(
+        test_path
+    )
+
+    # Remap labels to contiguous 0..C-1
+    unique_labels = np.unique(
+        np.concatenate([y_train, y_test])
+    )
+
+    label_map = {
+        old: new
+        for new, old in enumerate(unique_labels)
+    }
+
+    y_train = np.array(
+        [label_map[v] for v in y_train],
+        dtype=np.int64
+    )
+    y_test = np.array(
+        [label_map[v] for v in y_test],
+        dtype=np.int64
+    )
+
+    seq_len = X_train.shape[1]
+
+    mean = torch.tensor(
+        X_train.mean(axis=0),
+        dtype=torch.float32
+    ).view(1, 1, -1)
+
+    std = torch.tensor(
+        X_train.std(axis=0),
+        dtype=torch.float32
+    ).view(1, 1, -1)
+
+    train_ds = FordADataset(
+        X_train, y_train, mean=mean, std=std
+    )
+
+    test_ds = FordADataset(
+        X_test, y_test, mean=mean, std=std
+    )
+
+    print(
+        f"FordA: train={len(train_ds)} "
+        f"test={len(test_ds)} "
+        f"seq_len={seq_len} "
+        f"classes={len(np.unique(y_train))} "
+        f"label_map={label_map}"
+    )
+
+    return train_ds, test_ds, seq_len
 
 
 # =========================================================
@@ -117,7 +325,7 @@ HIDDEN_DIM = 256
 #   train_subset_fraction, test_subset_fraction
 # ---------------------------------------------------------
 
-DATASET_NAME = "cifar10"
+DATASET_NAME = "forda"
 
 DATASET_REGISTRY = {
 
@@ -160,6 +368,25 @@ DATASET_REGISTRY = {
         "train_subset_fraction": 0.4,
         "test_subset_fraction": 0.5,
         "epsilons": [0.02, 0.031, 0.05, 0.08, 0.12],
+    },
+
+    "forda": {
+        "dataset_loader": load_forda,
+        "input_shape": (1, 500),
+        "flatten": False,
+        "arch": "resnet1d",
+        "num_classes": 2,
+        "train_transform": None,
+        "test_transform": None,
+        "epochs": 30,
+        "batch_size": 128,
+        "hidden_dim": 128,
+        "latent_dim": 32,
+        "train_subset_fraction": 1.0,
+        "test_subset_fraction": 1.0,
+        "epsilons": [0.1, 0.2, 0.5, 1.0, 2.0],
+        "adv_train_epsilon": 0.5,
+        "adv_train_pgd_steps": 5,
     },
 }
 
@@ -222,6 +449,19 @@ TSALLIS_ALPHA = 0.95
 
 
 SEED = 42
+
+
+# ---------------------------------------------------------
+# Clamp output for adversarial attacks
+#
+# Image datasets (pixel range [0, 1]) need clamping;
+# time-series datasets (z-score normalised) do not.
+# ---------------------------------------------------------
+
+CLAMP_OUTPUT = DATASET_CONFIG.get(
+    "clamp_output",
+    "dataset_class" in DATASET_CONFIG
+)
 
 
 DIVERGENCES = [
@@ -573,29 +813,55 @@ def make_collate(flatten):
 _collate_fn = make_collate(FLATTEN_INPUTS)
 
 
-dataset_cls = DATASET_CONFIG["dataset_class"]
+# ---------------------------------------------------------
+# Dataset loading
+#
+# Custom datasets (e.g. FordA) provide a "dataset_loader"
+# callable instead of "dataset_class".  The loader returns
+# (train_dataset, test_dataset[, extra_info]).
+# ---------------------------------------------------------
 
+if "dataset_loader" in DATASET_CONFIG:
 
-train_dataset = dataset_cls(
-    root=os.path.join(
-        ROOT_DIR,
-        "data"
-    ),
-    train=True,
-    download=True,
-    transform=TRAIN_TRANSFORM
-)
+    _loader = DATASET_CONFIG["dataset_loader"]
 
+    _loaded = _loader(
+        os.path.join(ROOT_DIR)
+    )
 
-test_dataset = dataset_cls(
-    root=os.path.join(
-        ROOT_DIR,
-        "data"
-    ),
-    train=False,
-    download=True,
-    transform=TEST_TRANSFORM
-)
+    train_dataset = _loaded[0]
+
+    test_dataset = _loaded[1]
+
+    if len(_loaded) > 2:
+
+        SEQ_LEN = _loaded[2]
+
+else:
+
+    dataset_cls = DATASET_CONFIG["dataset_class"]
+
+    train_dataset = dataset_cls(
+        root=os.path.join(
+            ROOT_DIR,
+            "data"
+        ),
+        train=True,
+        download=True,
+        transform=TRAIN_TRANSFORM
+    )
+
+    test_dataset = dataset_cls(
+        root=os.path.join(
+            ROOT_DIR,
+            "data"
+        ),
+        train=False,
+        download=True,
+        transform=TEST_TRANSFORM
+    )
+
+    SEQ_LEN = None
 
 
 # ---------------------------------------------------------
@@ -752,7 +1018,8 @@ def train_model(
                     ADV_TRAIN_EPSILON,
                     device,
                     method=training_mode,
-                    num_steps=ADV_TRAIN_PGD_STEPS
+                    num_steps=ADV_TRAIN_PGD_STEPS,
+                    clamp_output=CLAMP_OUTPUT
                 )
 
 
@@ -1033,7 +1300,8 @@ def run_adversarial_evaluation(
             fgsm_attack,
             test_loader,
             epsilon,
-            device
+            device,
+            clamp_output=CLAMP_OUTPUT
         )
 
         print(
@@ -1050,7 +1318,8 @@ def run_adversarial_evaluation(
         )
 
         def pgd_attack_fn(
-            model, images, labels, eps, dev
+            model, images, labels, eps, dev,
+            clamp_output=True
         ):
             return pgd_attack(
                 model,
@@ -1059,7 +1328,8 @@ def run_adversarial_evaluation(
                 eps,
                 dev,
                 num_steps=PGD_STEPS,
-                step_size=PGD_STEP_SIZE
+                step_size=PGD_STEP_SIZE,
+                clamp_output=clamp_output
             )
 
         pgd_accuracy = evaluate_under_attack(
@@ -1067,7 +1337,8 @@ def run_adversarial_evaluation(
             pgd_attack_fn,
             test_loader,
             epsilon,
-            device
+            device,
+            clamp_output=CLAMP_OUTPUT
         )
 
         print(
@@ -1538,7 +1809,9 @@ def run_mode(training_mode):
             input_shape=INPUT_SHAPE,
             hidden_dim=HIDDEN_DIM,
             latent_dim=LATENT_DIM,
-            num_classes=NUM_CLASSES
+            num_classes=NUM_CLASSES,
+            seq_len=SEQ_LEN,
+            in_channels=INPUT_SHAPE[0]
         ).to(device)
 
 
